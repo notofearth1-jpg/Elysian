@@ -1719,10 +1719,18 @@ async def submit_reading_exercise(request: ReadingSubmissionRequest, user_id: st
 
 app.include_router(api_router)
 
+app = FastAPI()
+
+# Add this CORS middleware configuration
+origins = [
+    "https://elysian-nine.vercel.app",
+    "http://localhost:3000",
+]
+
 app.add_middleware(
     CORSMiddleware,
+    allow_origins=origins,
     allow_credentials=True,
-    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
