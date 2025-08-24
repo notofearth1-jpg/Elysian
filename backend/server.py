@@ -85,7 +85,7 @@ except ImportError as e:
 
 # ==================== SIMPLIFIED AUTHENTICATION FOR DEMO ====================
 
-async def verify_firebase_token(authorization: str = Header(None)) -> str:
+async def verify_firebase_token(authorization: Optional[str] = Header(None)) -> str:
     """
     Simplified token verification for demo purposes
     In production, this would verify actual Firebase tokens
@@ -265,8 +265,11 @@ mock_db = {
     "users": {},
     "lessons": {},
     "conversations": {},
+    "conversation_messages": {},
     "speaking_attempts": {},
-    "user_weaknesses": {}
+    "user_weaknesses": {},
+    "lesson_attempts": {},
+    "immersion_content": {}
 }
 
 async def get_db_collection(collection_name: str):
@@ -280,7 +283,9 @@ async def get_db_collection(collection_name: str):
 class MockCollection:
     def __init__(self, name):
         self.name = name
-        self.data = mock_db.get(name, {})
+        if name not in mock_db:
+            mock_db[name] = {}
+        self.data = mock_db[name]
     
     async def find_one(self, query):
         # Simple mock implementation
@@ -288,29 +293,126 @@ class MockCollection:
             return self.data.get(query)
         elif isinstance(query, dict):
             for key, value in self.data.items():
-                if all(value.get(k) == v for k, v in query.items() if k in value):
-                    return value
+                # Handle different query types
+                if isinstance(value, dict):
+                    match = True
+                    for k, v in query.items():
+                        if k not in value:
+                            match = False
+                            break
+                        
+                        # Handle regex queries
+                        if isinstance(v, dict) and '$regex' in v:
+                            if v['$regex'] not in str(value[k]):
+                                match = False
+                                break
+                        # Handle date range queries
+                        elif isinstance(v, dict) and ('$gte' in v or '$lt' in v):
+                            # For demo, just return True for date queries
+                            continue
+                        elif value[k] != v:
+                            match = False
+                            break
+                    if match:
+                        return value
         return None
+    
+    def find(self, query):
+        """Return a mock cursor for find operations"""
+        return MockCursor(self.data, query)
     
     async def insert_one(self, document):
         doc_id = document.get("id", str(uuid.uuid4()))
+        document["id"] = doc_id  # Ensure ID is in document
         self.data[doc_id] = document
         return type('MockResult', (), {'inserted_id': doc_id})()
     
     async def update_one(self, query, update):
         # Simple mock update
         for key, value in self.data.items():
-            if isinstance(query, dict):
-                if all(value.get(k) == v for k, v in query.items() if k in value):
+            if isinstance(query, dict) and isinstance(value, dict):
+                match = True
+                for k, v in query.items():
+                    if value.get(k) != v:
+                        match = False
+                        break
+                if match:
                     if "$set" in update:
                         value.update(update["$set"])
                     if "$inc" in update:
                         for k, v in update["$inc"].items():
-                            value[k] = value.get(k, 0) + v
+                            # Handle nested keys like "skill_profile.grammar"
+                            if '.' in k:
+                                keys = k.split('.')
+                                nested = value
+                                for nested_key in keys[:-1]:
+                                    if nested_key not in nested:
+                                        nested[nested_key] = {}
+                                    nested = nested[nested_key]
+                                nested[keys[-1]] = nested.get(keys[-1], 0) + v
+                            else:
+                                value[k] = value.get(k, 0) + v
+                    if "$currentDate" in update:
+                        for k, v in update["$currentDate"].items():
+                            value[k] = datetime.utcnow()
+                    if "$max" in update:
+                        for k, v in update["$max"].items():
+                            value[k] = max(value.get(k, 0), v)
                     break
     
     async def count_documents(self, query):
-        return len([d for d in self.data.values() if all(d.get(k) == v for k, v in query.items())])
+        count = 0
+        for value in self.data.values():
+            if isinstance(value, dict):
+                match = True
+                for k, v in query.items():
+                    if value.get(k) != v:
+                        match = False
+                        break
+                if match:
+                    count += 1
+        return count
+
+class MockCursor:
+    def __init__(self, data, query):
+        self.data = data
+        self.query = query
+        self._results = []
+        self._limit = None
+        self._sort_field = None
+        self._sort_direction = 1
+        
+    def sort(self, field, direction):
+        self._sort_field = field
+        self._sort_direction = direction
+        return self
+        
+    def limit(self, count):
+        self._limit = count
+        return self
+        
+    async def to_list(self, length):
+        # Filter data based on query
+        results = []
+        for value in self.data.values():
+            if isinstance(value, dict):
+                match = True
+                for k, v in self.query.items():
+                    if value.get(k) != v:
+                        match = False
+                        break
+                if match:
+                    results.append(value)
+        
+        # Sort if specified
+        if self._sort_field and self._sort_field in results[0] if results else False:
+            results.sort(key=lambda x: x.get(self._sort_field, 0), reverse=self._sort_direction == -1)
+            
+        # Apply limit
+        if self._limit:
+            results = results[:self._limit]
+            
+        return results
 
 # ==================== GAMIFICATION SYSTEM ====================
 
@@ -476,7 +578,8 @@ class ElysianAI:
             return ["grammar: past tense", "vocabulary: advanced words"]
         
         try:
-            weaknesses = await weaknesses_collection.find({"user_id": user_id}).sort("frequency", -1).limit(5).to_list(5)
+            cursor = weaknesses_collection.find({"user_id": user_id}).sort("frequency", -1).limit(5)
+            weaknesses = await cursor.to_list(5)
             return [f"{w['type']}: {w['item']}" for w in weaknesses]
         except:
             return []
@@ -744,36 +847,42 @@ async def api_root():
 @app.get("/api/user/profile")
 async def get_user_profile(user_id: str = Depends(verify_firebase_token)):
     """Get authenticated user's profile"""
-    user = await get_or_create_user(user_id)
-    return user
+    try:
+        user = await get_or_create_user(user_id)
+        return user.dict()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching user profile: {str(e)}")
 
 @app.post("/api/conversations/start")
 async def start_conversation(request: dict, user_id: str = Depends(verify_firebase_token)):
     """Start a new conversation session"""
-    await update_daily_streak(user_id)
-    
-    conversation = ConversationSession(
-        user_id=user_id,
-        conversation_type=request.get("conversation_type", "freestyle")
-    )
-    
-    conversations_collection = await get_db_collection("conversations")
-    await conversations_collection.insert_one(conversation.dict())
-    
-    welcome_message = ConversationMessage(
-        conversation_id=conversation.id,
-        sender="elysian",
-        content="Hello! I'm Elysian, your personal English learning companion. I remember our previous conversations and your learning journey. What would you like to practice today? 😊"
-    )
-    
-    messages_collection = await get_db_collection("conversation_messages")
-    await messages_collection.insert_one(welcome_message.dict())
-    
-    return {
-        "conversation_id": conversation.id,
-        "welcome_message": welcome_message.content,
-        "conversation_type": conversation.conversation_type
-    }
+    try:
+        await update_daily_streak(user_id)
+        
+        conversation = ConversationSession(
+            user_id=user_id,
+            conversation_type=request.get("conversation_type", "freestyle")
+        )
+        
+        conversations_collection = await get_db_collection("conversations")
+        await conversations_collection.insert_one(conversation.dict())
+        
+        welcome_message = ConversationMessage(
+            conversation_id=conversation.id,
+            sender="elysian",
+            content="Hello! I'm Elysian, your personal English learning companion. I remember our previous conversations and your learning journey. What would you like to practice today? 😊"
+        )
+        
+        messages_collection = await get_db_collection("conversation_messages")
+        await messages_collection.insert_one(welcome_message.dict())
+        
+        return {
+            "conversation_id": conversation.id,
+            "welcome_message": welcome_message.content,
+            "conversation_type": conversation.conversation_type
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error starting conversation: {str(e)}")
 
 @app.post("/api/conversations/message")
 async def send_message(request: MessageRequest, user_id: str = Depends(verify_firebase_token)):
@@ -793,22 +902,26 @@ async def send_message(request: MessageRequest, user_id: str = Depends(verify_fi
         
         # Generate AI response (fallback for demo)
         if AI_AVAILABLE and elysian_ai.gemini_api_key:
-            # Enhanced AI response with user memory
-            chat = LlmChat(
-                api_key=elysian_ai.gemini_api_key,
-                session_id=request.conversation_id,
-                system_message=f"""You are Elysian, {user.name}'s compassionate English learning companion. You remember their learning journey:
-                
+            try:
+                # Enhanced AI response with user memory
+                chat = LlmChat(
+                    api_key=elysian_ai.gemini_api_key,
+                    session_id=request.conversation_id,
+                    system_message=f"""You are Elysian, {user.name}'s compassionate English learning companion. You remember their learning journey:
+                    
 - Current Level: {user.current_cefr_level} 
 - Learning Goal: {user.primary_goal or 'General improvement'}
 - Interests: {', '.join(user.interests) if user.interests else 'Various topics'}
 - Progress: Level {user.level} with {user.xp} XP
 
 Be encouraging, provide gentle corrections, and naturally incorporate vocabulary and grammar appropriate for their level."""
-            ).with_model("gemini", "gemini-2.0-flash").with_max_tokens(1000)
-            
-            message = UserMessage(text=request.message)
-            ai_response = await chat.send_message(message)
+                ).with_model("gemini", "gemini-2.0-flash").with_max_tokens(1000)
+                
+                message = UserMessage(text=request.message)
+                ai_response = await chat.send_message(message)
+            except Exception as ai_error:
+                print(f"AI response error: {ai_error}")
+                ai_response = f"Thank you for sharing that with me! I can see you're working on your English. That's a great sentence structure. Keep practicing - you're doing well at the {user.current_cefr_level} level!"
         else:
             # Fallback response for demo
             ai_response = f"Thank you for sharing that with me! I can see you're working on your English. That's a great sentence structure. Keep practicing - you're doing well at the {user.current_cefr_level} level!"
@@ -852,7 +965,7 @@ async def get_today_lesson(user_id: str = Depends(verify_firebase_token)):
         })
         
         if existing_lesson:
-            return DailyLesson(**existing_lesson)
+            return existing_lesson
         
         # Generate new lesson with user memory
         exercises = await elysian_ai.generate_daily_lesson_with_memory(user)
@@ -865,7 +978,7 @@ async def get_today_lesson(user_id: str = Depends(verify_firebase_token)):
         
         await lessons_collection.insert_one(lesson.dict())
         
-        return lesson
+        return lesson.dict()
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error generating lesson: {str(e)}")
@@ -993,9 +1106,10 @@ async def get_dashboard(user_id: str = Depends(verify_firebase_token)):
         # Get user weaknesses for recommendations
         weaknesses_collection = await get_db_collection("user_weaknesses")
         try:
-            weaknesses = await weaknesses_collection.find({
+            cursor = weaknesses_collection.find({
                 "user_id": user_id
-            }).sort("frequency", -1).limit(3).to_list(3)
+            }).sort("frequency", -1).limit(3)
+            weaknesses = await cursor.to_list(3)
         except:
             weaknesses = []
         
