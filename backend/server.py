@@ -346,6 +346,50 @@ class ListeningChallenge(BaseModel):
         arbitrary_types_allowed = True
         json_encoders = {ObjectId: str}
 
+class ReadingArticle(BaseModel):
+    id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
+    title: str
+    content: str
+    cefr_level: str
+    topic: str
+    word_count: int
+    estimated_reading_time: int
+    vocabulary_highlights: List[str]
+    comprehension_questions: List[Dict[str, Any]]
+
+    class Config:
+        allow_population_by_field_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str}
+
+class DailyActivity(BaseModel):
+    type: str
+    completed: bool
+    progress: int
+    description: str
+    xp_reward: int
+
+class WeeklyStats(BaseModel):
+    lessons_completed: int
+    consistency_score: int
+    xp_this_week: int
+
+class Gamification(BaseModel):
+    current_level: int
+    current_xp: int
+    xp_for_next_level: int
+    daily_streak: int
+    longest_streak: int
+
+class DashboardResponse(BaseModel):
+    user: User
+    daily_activities: List[DailyActivity]
+    skill_overview: SkillProfile
+    recent_achievements: List[str]
+    weekly_stats: WeeklyStats
+    recommendations: List[str]
+    gamification: Gamification
+
 # ==================== MOCK DATABASE FOR DEMO ====================
 
 # Simple in-memory storage for demo when MongoDB is not available
@@ -848,6 +892,87 @@ Respond with JSON:
         except Exception as e:
             print(f"Error evaluating answer: {e}")
             return True, "Thank you for your answer! Keep practicing!"
+    
+    async def generate_reading_articles(self, user_profile: User) -> List[ReadingArticle]:
+        """Generate reading articles with AI"""
+        if not AI_AVAILABLE or not self.gemini_api_key:
+            logger.warning("AI not available for generating reading articles. Returning empty list.")
+            return [] # Return empty list if AI is not available
+
+        try:
+            prompt = f"""You are Elysian, an expert in creating educational content for English learners.
+
+STUDENT PROFILE:
+- Name: {user_profile.name}
+- CEFR Level: {user_profile.current_cefr_level}
+- Interests: {', '.join(user_profile.interests) if user_profile.interests else 'General topics'}
+
+INSTRUCTIONS:
+Generate a JSON object containing a list of 3 short reading articles (about 150-200 words each) tailored to the student's CEFR level and interests. Each article should include:
+- A title
+- The full content of the article
+- The CEFR level it's appropriate for
+- The main topic
+- The word count
+- An estimated reading time in minutes
+- A list of 4-5 key vocabulary words or phrases from the text
+- 2-3 comprehension questions (one multiple-choice, one open-ended) with correct answers.
+
+Format:
+{{
+    "articles": [
+        {{
+            "title": "...",
+            "content": "...",
+            "cefr_level": "{user_profile.current_cefr_level}",
+            "topic": "...",
+            "word_count": ...,
+            "estimated_reading_time": ...,
+            "vocabulary_highlights": ["...", "..."],
+            "comprehension_questions": [
+                {{
+                    "question": "...",
+                    "type": "multiple_choice",
+                    "options": ["...", "...", "..."],
+                    "correct_answer": "..."
+                }},
+                {{
+                    "question": "...",
+                    "type": "open_ended",
+                    "correct_answer": "..."
+                }}
+            ]
+        }}
+    ]
+}}
+"""
+            chat = LlmChat(
+                api_key=self.gemini_api_key,
+                session_id=f"reading_{user_profile.firebase_uid}_{datetime.now().strftime('%Y%m%d')}",
+                system_message="You are Elysian, an expert in creating educational content."
+            ).with_model("gemini", "gemini-2.0-flash").with_max_tokens(2000)
+
+            message = UserMessage(text=prompt)
+            response = await chat.send_message(message)
+
+            try:
+                data = json.loads(response)
+                articles_data = data.get("articles", [])
+                
+                articles = []
+                for article_data in articles_data:
+                    # Ensure all required fields are present
+                    if all(k in article_data for k in ["title", "content", "cefr_level", "topic", "word_count", "estimated_reading_time", "vocabulary_highlights", "comprehension_questions"]):
+                        articles.append(ReadingArticle(**article_data))
+
+                return articles
+            except (json.JSONDecodeError, TypeError) as e:
+                logger.error(f"Error parsing AI response for reading articles: {e}")
+                return []
+
+        except Exception as e:
+            logger.error(f"Error generating reading articles: {e}")
+            return []
 
 # Initialize AI
 elysian_ai = ElysianAI()
@@ -1053,7 +1178,7 @@ async def get_today_lesson(user_id: str = Depends(verify_firebase_token)):
         })
         
         if existing_lesson:
-            return existing_lesson
+            return DailyLesson(**existing_lesson)
         
         # Generate new lesson with user memory
         exercises = await elysian_ai.generate_daily_lesson_with_memory(user)
@@ -1130,7 +1255,7 @@ async def submit_answer(request: SubmitAnswerRequest, user_id: str = Depends(ver
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error submitting answer: {str(e)}")
 
-@app.get("/api/dashboard")
+@app.get("/api/dashboard", response_model=DashboardResponse)
 async def get_dashboard(user_id: str = Depends(verify_firebase_token)):
     """Get comprehensive dashboard data"""
     try:
@@ -1224,25 +1349,25 @@ async def get_dashboard(user_id: str = Depends(verify_firebase_token)):
             f"🏆 Longest streak: {user.longest_streak} days"
         ]
         
-        return {
-            "user": user.dict(),
-            "daily_activities": daily_activities,
-            "skill_overview": user.skill_profile.dict(),
-            "recent_achievements": recent_achievements[:3],
-            "weekly_stats": {
+        return DashboardResponse(
+            user=user,
+            daily_activities=daily_activities,
+            skill_overview=user.skill_profile,
+            recent_achievements=recent_achievements[:3],
+            weekly_stats={
                 "lessons_completed": weekly_lessons,
                 "consistency_score": min(100, weekly_lessons * 15),
                 "xp_this_week": min(user.xp, 350)  # Estimate
             },
-            "recommendations": recommendations[:2],
-            "gamification": {
+            recommendations=recommendations[:2],
+            gamification={
                 "current_level": user.level,
                 "current_xp": user.xp,
                 "xp_for_next_level": GamificationManager.xp_needed_for_next_level(user.level),
                 "daily_streak": user.daily_streak,
                 "longest_streak": user.longest_streak
             }
-        }
+        )
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error getting dashboard: {str(e)}")
@@ -1746,7 +1871,7 @@ async def submit_listening_exercise(request: ListeningSubmissionRequest, user_id
 
 # ==================== READING MODULE API ROUTES ====================
 
-@app.get("/api/read/library")
+@app.get("/api/read/library", response_model=List[ReadingArticle])
 async def get_reading_library(user_id: str = Depends(verify_firebase_token)):
     """Get personalized reading library"""
     try:
@@ -1756,123 +1881,32 @@ async def get_reading_library(user_id: str = Depends(verify_firebase_token)):
         # Get user profile for level-appropriate content
         user = await get_or_create_user(user_id)
         
-        # Sample articles
-        sample_articles = [
-            {
-                "id": str(uuid.uuid4()),
-                "title": "The Benefits of Reading",
-                "content": "Reading is one of the most important skills we can develop. When we read regularly, we improve our vocabulary, learn new ideas, and exercise our brain. Scientists have discovered that reading can help reduce stress and improve memory. People who read books are often better at solving problems and thinking creatively. Reading also helps us understand different cultures and perspectives. Whether you prefer fiction or non-fiction, newspapers or magazines, the important thing is to read something every day. Even reading for just fifteen minutes can make a big difference in your life.",
-                "cefr_level": user.current_cefr_level,
-                "topic": "education",
-                "word_count": 120,
-                "estimated_reading_time": 2,
-                "vocabulary_highlights": ["vocabulary", "perspectives", "creativity", "reduce stress"],
-                "comprehension_questions": [
-                    {
-                        "question": "According to the text, what are two benefits of reading?",
-                        "type": "open_ended",
-                        "correct_answer": "Improves vocabulary and reduces stress (among others)"
-                    },
-                    {
-                        "question": "How long should you read each day according to the article?",
-                        "type": "multiple_choice",
-                        "options": ["5 minutes", "15 minutes", "30 minutes", "1 hour"],
-                        "correct_answer": "15 minutes"
-                    }
-                ]
-            },
-            {
-                "id": str(uuid.uuid4()),
-                "title": "Climate Change Solutions",
-                "content": "Climate change is one of the biggest challenges facing humanity today. Rising global temperatures are causing more extreme weather events, melting ice caps, and rising sea levels. However, there are many solutions that individuals and governments can implement. Renewable energy sources like solar and wind power are becoming more affordable and efficient. Electric vehicles are replacing gasoline-powered cars in many countries. Cities are creating more green spaces and encouraging public transportation. Individuals can help by reducing energy consumption, eating less meat, and recycling more. While the problem is complex, collective action can make a significant difference in slowing climate change and protecting our planet for future generations.",
-                "cefr_level": user.current_cefr_level,
-                "topic": "environment",
-                "word_count": 150,
-                "estimated_reading_time": 3,
-                "vocabulary_highlights": ["renewable energy", "collective action", "consumption", "implement"],
-                "comprehension_questions": [
-                    {
-                        "question": "What are three solutions to climate change mentioned in the text?",
-                        "type": "open_ended",
-                        "correct_answer": "Renewable energy, electric vehicles, green spaces (among others)"
-                    },
-                    {
-                        "question": "What can individuals do to help with climate change?",
-                        "type": "multiple_choice",
-                        "options": ["Only use solar power", "Reduce energy and eat less meat", "Move to another country", "Do nothing"],
-                        "correct_answer": "Reduce energy and eat less meat"
-                    }
-                ]
-            },
-            {
-                "id": str(uuid.uuid4()),
-                "title": "The Future of Work",
-                "content": "Technology is rapidly changing the nature of work around the world. Artificial intelligence and automation are replacing many traditional jobs, but they are also creating new opportunities. Remote work has become much more common, especially after the global pandemic. Many companies now allow employees to work from home several days per week. This flexibility can improve work-life balance and reduce commuting time. However, it also presents challenges such as maintaining team communication and company culture. Workers need to continuously develop new skills to stay relevant in the changing job market. Critical thinking, creativity, and emotional intelligence are becoming more valuable than ever. The key to success in the future workplace will be adaptability and lifelong learning.",
-                "cefr_level": user.current_cefr_level,
-                "topic": "technology",
-                "word_count": 180,
-                "estimated_reading_time": 4,
-                "vocabulary_highlights": ["automation", "flexibility", "adaptability", "emotional intelligence"],
-                "comprehension_questions": [
-                    {
-                        "question": "What skills are becoming more valuable according to the text?",
-                        "type": "open_ended",
-                        "correct_answer": "Critical thinking, creativity, and emotional intelligence"
-                    },
-                    {
-                        "question": "What is the key to success in the future workplace?",
-                        "type": "multiple_choice",
-                        "options": ["Working from home", "Using AI", "Adaptability and lifelong learning", "Avoiding technology"],
-                        "correct_answer": "Adaptability and lifelong learning"
-                    }
-                ]
-            }
-        ]
+        # Generate articles with AI
+        articles = await elysian_ai.generate_reading_articles(user)
         
-        return {"articles": sample_articles}
+        if not articles:
+            raise HTTPException(status_code=500, detail="Failed to generate reading articles")
+
+        # Save articles to the database
+        articles_collection = await get_db_collection("reading_articles")
+        await articles_collection.insert_many([article.dict(by_alias=True) for article in articles])
+        
+        return articles
         
     except Exception as e:
         logger.error(f"Error fetching reading library: {e}")
         raise HTTPException(status_code=500, detail=f"Error fetching reading library: {str(e)}")
 
-@app.get("/api/read/article/{content_id}")
+@app.get("/api/read/article/{content_id}", response_model=ReadingArticle)
 async def get_reading_article(content_id: str, user_id: str = Depends(verify_firebase_token)):
     """Get a specific reading article"""
     try:
-        # In a real implementation, this would fetch from database
-        # For now, return a sample article based on content_id
-        
-        sample_article = {
-            "id": content_id,
-            "title": "The Power of Artificial Intelligence",
-            "content": "Artificial Intelligence (AI) is transforming every aspect of our lives in ways we never imagined possible. From the moment we wake up and check our smartphones to the recommendations we receive on streaming platforms, AI algorithms are working behind the scenes to enhance our daily experiences. In healthcare, AI is revolutionizing diagnosis and treatment by analyzing medical images with unprecedented accuracy and speed. Doctors can now detect diseases like cancer much earlier than ever before, potentially saving millions of lives. In transportation, self-driving cars are being tested on roads around the world, promising to reduce accidents and traffic congestion. The financial industry uses AI to detect fraud, assess credit risks, and provide personalized investment advice. However, this rapid advancement also raises important questions about privacy, employment, and the ethical use of technology. As AI becomes more sophisticated, society must carefully balance innovation with responsibility to ensure that these powerful tools benefit everyone.",
-            "cefr_level": "B2",
-            "topic": "technology",
-            "word_count": 195,
-            "estimated_reading_time": 4,
-            "vocabulary_highlights": ["unprecedented", "revolutionizing", "sophisticated", "algorithms"],
-            "comprehension_questions": [
-                {
-                    "question": "In which industries is AI being used according to the text?",
-                    "type": "open_ended",
-                    "correct_answer": "Healthcare, transportation, and finance"
-                },
-                {
-                    "question": "What is one concern about AI mentioned in the text?",
-                    "type": "multiple_choice",
-                    "options": ["It's too expensive", "Privacy and employment issues", "It doesn't work well", "It's too slow"],
-                    "correct_answer": "Privacy and employment issues"
-                },
-                {
-                    "question": "How is AI helping in healthcare?",
-                    "type": "multiple_choice",
-                    "options": ["By replacing all doctors", "By analyzing medical images accurately", "By reducing hospital costs", "By eliminating all diseases"],
-                    "correct_answer": "By analyzing medical images accurately"
-                }
-            ]
-        }
-        
-        return sample_article
+        articles_collection = await get_db_collection("reading_articles")
+        article = await articles_collection.find_one({"_id": ObjectId(content_id)})
+        if not article:
+            raise HTTPException(status_code=404, detail="Article not found")
+            
+        return article
         
     except Exception as e:
         logger.error(f"Error fetching article: {e}")
@@ -1882,33 +1916,18 @@ async def get_reading_article(content_id: str, user_id: str = Depends(verify_fir
 async def submit_reading_exercise(request: ReadingSubmissionRequest, user_id: str = Depends(verify_firebase_token)):
     """Submit reading comprehension answers"""
     try:
-        # Get the article (in real implementation, from database)
-        # For now, use sample questions for evaluation
-        
-        sample_questions = [
-            {
-                "question": "In which industries is AI being used according to the text?",
-                "type": "open_ended",
-                "correct_answer": "Healthcare, transportation, and finance"
-            },
-            {
-                "question": "What is one concern about AI mentioned in the text?",
-                "type": "multiple_choice",
-                "correct_answer": "Privacy and employment issues"
-            },
-            {
-                "question": "How is AI helping in healthcare?",
-                "type": "multiple_choice",
-                "correct_answer": "By analyzing medical images accurately"
-            }
-        ]
+        # Get the article from the database
+        articles_collection = await get_db_collection("reading_articles")
+        article = await articles_collection.find_one({"_id": ObjectId(request.content_id)})
+        if not article:
+            raise HTTPException(status_code=404, detail="Article not found")
         
         # Evaluate answers
-        total_questions = len(sample_questions)
+        total_questions = len(article["comprehension_questions"])
         correct_answers = 0
         detailed_results = []
         
-        for i, question in enumerate(sample_questions):
+        for i, question in enumerate(article["comprehension_questions"]):
             user_answer = request.comprehension_answers[i] if i < len(request.comprehension_answers) else ""
             
             if question["type"] == "multiple_choice":
@@ -1934,7 +1953,7 @@ async def submit_reading_exercise(request: ReadingSubmissionRequest, user_id: st
         score = (correct_answers / total_questions) * 100
         
         # Calculate reading speed (words per minute)
-        reading_speed = 195 / (request.reading_time / 60)  # 195 words in the sample article
+        reading_speed = article["word_count"] / (request.reading_time / 60)
         
         # Generate feedback
         if score >= 90 and reading_speed > 200:
