@@ -15,6 +15,7 @@ import json
 import random
 import base64
 import io
+from bson import ObjectId # Import ObjectId
 
 # Google Cloud imports for TTS/STT
 try:
@@ -83,6 +84,23 @@ except ImportError as e:
     UserMessage = None
     AI_AVAILABLE = False
 
+# ==================== HELPER FOR MONGODB OBJECTID ====================
+class PyObjectId(ObjectId):
+    @classmethod
+    def __get_validators__(cls):
+        yield cls.validate
+
+    @classmethod
+    def validate(cls, v):
+        if not ObjectId.is_valid(v):
+            raise ValueError("Invalid objectid")
+        return ObjectId(v)
+
+    @classmethod
+    def __get_pydantic_json_schema__(cls, field_schema):
+        field_schema.update(type="string")
+
+
 # ==================== SIMPLIFIED AUTHENTICATION FOR DEMO ====================
 
 async def verify_firebase_token(authorization: Optional[str] = Header(None)) -> str:
@@ -130,7 +148,7 @@ class SkillProfile(BaseModel):
     intonation_score: float = 50.0
 
 class User(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
     firebase_uid: str
     email: str
     name: str
@@ -153,6 +171,11 @@ class User(BaseModel):
     longest_streak: int = 0
     last_activity_date: Optional[datetime] = None
 
+    class Config:
+        allow_population_by_field_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str}
+
 class UserCreate(BaseModel):
     email: str
     name: str
@@ -161,7 +184,7 @@ class UserCreate(BaseModel):
     interests: List[str] = []
 
 class UserWeakness(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
     user_id: str
     type: str  # "grammar", "vocabulary", "pronunciation", etc.
     item: str  # specific weakness like "past perfect tense"
@@ -169,21 +192,36 @@ class UserWeakness(BaseModel):
     last_encountered: datetime = Field(default_factory=datetime.utcnow)
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
+    class Config:
+        allow_population_by_field_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str}
+
 # Existing models...
 class ConversationSession(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
     user_id: str
     conversation_type: str = "freestyle"
     created_at: datetime = Field(default_factory=datetime.utcnow)
     last_message_at: datetime = Field(default_factory=datetime.utcnow)
+
+    class Config:
+        allow_population_by_field_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str}
     
 class ConversationMessage(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
     conversation_id: str
     sender: str
     content: str
     timestamp: datetime = Field(default_factory=datetime.utcnow)
     feedback: Optional[dict] = None
+
+    class Config:
+        allow_population_by_field_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str}
 
 class Exercise(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -195,15 +233,20 @@ class Exercise(BaseModel):
     skill_target: str
 
 class DailyLesson(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
     user_id: str
     created_at: datetime = Field(default_factory=datetime.utcnow)
     status: str = "pending"
     exercises: List[Exercise] = []
     target_skills: List[str] = []
 
+    class Config:
+        allow_population_by_field_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str}
+
 class LessonAttempt(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
     lesson_id: str
     user_id: str
     exercise_id: str
@@ -211,6 +254,11 @@ class LessonAttempt(BaseModel):
     is_correct: bool
     timestamp: datetime = Field(default_factory=datetime.utcnow)
     feedback: Optional[str] = None
+    
+    class Config:
+        allow_population_by_field_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str}
 
 # Request/Response models...
 class MessageRequest(BaseModel):
@@ -257,6 +305,29 @@ class SpeakingAnalysisResponse(BaseModel):
     feedback: str
     detailed_analysis: Dict[str, Any]
     xp_earned: int = 0
+
+class ListeningChallengeQuestion(BaseModel):
+    question: str
+    type: str
+    options: Optional[List[str]] = None
+    correct_answer: str
+
+class ListeningChallenge(BaseModel):
+    id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
+    user_id: str
+    title: str
+    description: str
+    topic: str
+    cefr_level: str
+    transcript: str
+    questions: List[ListeningChallengeQuestion]
+    duration: int
+    created_at: datetime
+
+    class Config:
+        allow_population_by_field_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str}
 
 # ==================== MOCK DATABASE FOR DEMO ====================
 
@@ -486,7 +557,7 @@ async def track_user_weakness(user_id: str, weakness_type: str, item: str):
             type=weakness_type,
             item=item
         )
-        await weaknesses_collection.insert_one(weakness.dict())
+        await weaknesses_collection.insert_one(weakness.dict(by_alias=True))
 
 # ==================== GOOGLE CLOUD INTEGRATION ====================
 
@@ -772,14 +843,14 @@ async def get_or_create_user(user_id: str, email: str = None, name: str = None) 
     user = await users_collection.find_one({"firebase_uid": user_id})
     if not user:
         # Create new user
-        user = User(
+        user_data = User(
             firebase_uid=user_id,
             email=email or f"{user_id}@example.com",
             name=name or "Elysian Learner",
             daily_streak=1
         )
-        await users_collection.insert_one(user.dict())
-        return user
+        await users_collection.insert_one(user_data.dict(by_alias=True))
+        return user_data
     return User(**user)
 
 async def update_daily_streak(user_id: str):
@@ -844,12 +915,12 @@ async def root():
 async def api_root():
     return {"message": "Elysian API - All endpoints are working", "status": "healthy"}
 
-@app.get("/api/user/profile")
+@app.get("/api/user/profile", response_model=User)
 async def get_user_profile(user_id: str = Depends(verify_firebase_token)):
     """Get authenticated user's profile"""
     try:
         user = await get_or_create_user(user_id)
-        return user.dict()
+        return user
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching user profile: {str(e)}")
 
@@ -865,19 +936,19 @@ async def start_conversation(request: dict, user_id: str = Depends(verify_fireba
         )
         
         conversations_collection = await get_db_collection("conversations")
-        await conversations_collection.insert_one(conversation.dict())
+        await conversations_collection.insert_one(conversation.dict(by_alias=True))
         
         welcome_message = ConversationMessage(
-            conversation_id=conversation.id,
+            conversation_id=str(conversation.id),
             sender="elysian",
             content="Hello! I'm Elysian, your personal English learning companion. I remember our previous conversations and your learning journey. What would you like to practice today? 😊"
         )
         
         messages_collection = await get_db_collection("conversation_messages")
-        await messages_collection.insert_one(welcome_message.dict())
+        await messages_collection.insert_one(welcome_message.dict(by_alias=True))
         
         return {
-            "conversation_id": conversation.id,
+            "conversation_id": str(conversation.id),
             "welcome_message": welcome_message.content,
             "conversation_type": conversation.conversation_type
         }
@@ -895,7 +966,7 @@ async def send_message(request: MessageRequest, user_id: str = Depends(verify_fi
             content=request.message
         )
         messages_collection = await get_db_collection("conversation_messages")
-        await messages_collection.insert_one(user_message.dict())
+        await messages_collection.insert_one(user_message.dict(by_alias=True))
         
         # Get user profile for personalized response
         user = await get_or_create_user(user_id)
@@ -933,7 +1004,7 @@ Be encouraging, provide gentle corrections, and naturally incorporate vocabulary
             content=ai_response,
             feedback={"message_length": len(request.message.split()), "encouragement": "Great job practicing!"}
         )
-        await messages_collection.insert_one(ai_message.dict())
+        await messages_collection.insert_one(ai_message.dict(by_alias=True))
         
         # Award XP for conversation
         xp_result = await update_user_xp(user_id, 5)
@@ -947,7 +1018,7 @@ Be encouraging, provide gentle corrections, and naturally incorporate vocabulary
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing message: {str(e)}")
 
-@app.get("/api/learn/today")
+@app.get("/api/learn/today", response_model=DailyLesson)
 async def get_today_lesson(user_id: str = Depends(verify_firebase_token)):
     """Get or create today's personalized lesson"""
     try:
@@ -976,9 +1047,9 @@ async def get_today_lesson(user_id: str = Depends(verify_firebase_token)):
             target_skills=list(set([ex.skill_target for ex in exercises]))
         )
         
-        await lessons_collection.insert_one(lesson.dict())
+        await lessons_collection.insert_one(lesson.dict(by_alias=True))
         
-        return lesson.dict()
+        return lesson
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error generating lesson: {str(e)}")
@@ -988,7 +1059,7 @@ async def submit_answer(request: SubmitAnswerRequest, user_id: str = Depends(ver
     """Submit an answer to a lesson exercise with XP rewards"""
     try:
         lessons_collection = await get_db_collection("lessons")
-        lesson = await lessons_collection.find_one({"id": request.lesson_id})
+        lesson = await lessons_collection.find_one({"_id": ObjectId(request.lesson_id)})
         if not lesson:
             raise HTTPException(status_code=404, detail="Lesson not found")
         
@@ -1016,7 +1087,7 @@ async def submit_answer(request: SubmitAnswerRequest, user_id: str = Depends(ver
             feedback=feedback
         )
         attempts_collection = await get_db_collection("lesson_attempts")
-        await attempts_collection.insert_one(attempt.dict())
+        await attempts_collection.insert_one(attempt.dict(by_alias=True))
         
         # Award XP and update skills
         xp_to_award = 5 if is_correct else 2  # Base XP
@@ -1421,7 +1492,7 @@ async def submit_speaking_exercise(request: SpeakingSubmissionRequest, user_id: 
 
 # ==================== LISTENING MODULE API ROUTES ====================
 
-@app.get("/api/listen/challenge")
+@app.get("/api/listen/challenge", response_model=ListeningChallenge)
 async def get_listening_challenge(user_id: str = Depends(verify_firebase_token)):
     """Get a listening challenge with audio content"""
     try:
@@ -1549,27 +1620,23 @@ async def get_listening_challenge(user_id: str = Depends(verify_firebase_token))
                 "duration": level_config["max_duration"] // 2
             }
         
-        # Create challenge ID
-        challenge_id = str(uuid.uuid4())
-        
         # Store challenge in database
-        challenge_doc = {
-            "id": challenge_id,
-            "user_id": user_id,
-            "title": challenge_data["title"],
-            "description": challenge_data["description"],
-            "topic": topic,
-            "cefr_level": user.current_cefr_level,
-            "transcript": challenge_data["transcript"],
-            "questions": challenge_data["questions"],
-            "duration": challenge_data["duration"],
-            "created_at": datetime.utcnow()
-        }
+        challenge = ListeningChallenge(
+            user_id=user_id,
+            title=challenge_data["title"],
+            description=challenge_data["description"],
+            topic=topic,
+            cefr_level=user.current_cefr_level,
+            transcript=challenge_data["transcript"],
+            questions=challenge_data["questions"],
+            duration=challenge_data["duration"],
+            created_at=datetime.utcnow()
+        )
         
         immersion_collection = await get_db_collection("immersion_content")
-        await immersion_collection.insert_one(challenge_doc)
+        await immersion_collection.insert_one(challenge.dict(by_alias=True))
         
-        return challenge_doc
+        return challenge
         
     except Exception as e:
         logger.error(f"Error generating listening challenge: {e}")
@@ -1581,7 +1648,7 @@ async def submit_listening_exercise(request: ListeningSubmissionRequest, user_id
     try:
         # Get the challenge from database
         immersion_collection = await get_db_collection("immersion_content")
-        challenge = await immersion_collection.find_one({"id": request.content_id})
+        challenge = await immersion_collection.find_one({"_id": ObjectId(request.content_id)})
         if not challenge:
             raise HTTPException(status_code=404, detail="Challenge not found")
         
